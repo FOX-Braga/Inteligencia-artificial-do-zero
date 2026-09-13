@@ -39,10 +39,56 @@ def estimate_loss(model, data, eval_iters=100):
 shared_state = {
     "loss": 0.0,
     "step": 0,
+    "total_steps": Config.MAX_ITERS,
+    "acc": 0.0,
+    "error_rate": 1.0,
+    "perplexity": 0.0,
+    "vocab_size": 0,
     "input_text": "",
     "output_text": "",
+    "inputs": [],      # valores 0-1 dos nós de entrada (15 últimos tokens)
+    "hidden1": [],     # ativações reais da 1ª camada oculta amostrada
+    "hidden2": [],     # ativações reais da 2ª camada oculta amostrada
+    "outputs": [],     # lista de (texto_do_token, prob) dos 10 mais prováveis
     "running": True,
 }
+
+def _setup_activation_hooks(model):
+    """
+    Registra hooks para capturar as ativações intermediárias reais do modelo.
+    Retorna um dict que o loop atualiza: {"h1": tensor(384,), "h2": tensor(384,)}
+    """
+    activations = {}
+
+    def _make_hook(name):
+        def fn(_module, _input, output):
+            activations[name] = output.detach().mean(dim=(0, 1))
+        return fn
+
+    third = max(1, Config.N_LAYER // 3)
+    two_thirds = max(1, 2 * Config.N_LAYER // 3)
+    model.blocks[third].register_forward_hook(_make_hook("h1"))
+    model.blocks[two_thirds].register_forward_hook(_make_hook("h2"))
+    return activations
+
+
+def _normalize(vals):
+    """Normaliza uma lista de números para 0-1 (min-max). Retorna lista float."""
+    if not vals:
+        return []
+    lo = min(vals)
+    hi = max(vals)
+    if hi <= lo:
+        return [1.0 if v >= hi else 0.0 for v in vals]
+    return [(v - lo) / (hi - lo) for v in vals]
+
+
+def _sample_activations(vector, n=14):
+    """Amostra n valores uniformemente de um vetor (ex: 384 ativações)."""
+    v = vector.float().cpu()
+    idx = torch.linspace(0, v.numel() - 1, n).long()
+    return _normalize(v[idx].tolist())
+
 
 def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=0):
     """Executa o treinamento em uma thread separada."""
@@ -52,19 +98,44 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
             print("GPU detectada via DirectML (AMD/Intel). Aceleração ativa.")
         print(f"Iniciando treinamento a partir do passo {start_iter}...")
 
+        shared_state["vocab_size"] = Config.VOCAB_SIZE
+        shared_state["total_steps"] = Config.MAX_ITERS
+        activations = _setup_activation_hooks(model)
+        n_inputs = min(15, Config.BLOCK_SIZE)
+
         for iter in range(start_iter, Config.MAX_ITERS):
             xb, yb = get_batch(train_data, Config.BLOCK_SIZE, Config.BATCH_SIZE, Config.DEVICE)
             logits, loss = model(xb, yb)
+            B, T = xb.shape
 
             # ── Atualiza a GUI IMEDIATAMENTE após cada forward pass ───────────
-            logits_b0    = logits[:Config.BLOCK_SIZE]
-            probs        = torch.nn.functional.softmax(logits_b0, dim=-1)
+            logits_3d    = logits.view(B, T, -1)
+            probs        = torch.nn.functional.softmax(logits_3d, dim=-1)
             pred_indices = torch.argmax(probs, dim=-1)
+
+            # Acurácia top-1 e % de erro deste batch
+            acc = (pred_indices == yb).float().mean().item()
+            ppl = torch.exp(loss).item()
+
+            # Entrada real (últimos tokens do contexto) normalizados para 0-1
+            raw_in = xb[0, -n_inputs:].float().cpu().div(max(1, Config.VOCAB_SIZE)).tolist()
+            # Saída real: top-10 tokens mais prováveis do último token previsto
+            last_probs = torch.nn.functional.softmax(logits_3d[0, -1, :], dim=-1)
+            topk = last_probs.topk(10)
+            out_labels = [tokenizer.decode([i]) for i in topk.indices.tolist()]
+            out_probs = [float(p) for p in topk.values.tolist()]
 
             shared_state["loss"]        = loss.item()
             shared_state["step"]        = iter
+            shared_state["acc"]         = acc
+            shared_state["error_rate"]  = 1.0 - acc
+            shared_state["perplexity"]  = ppl
             shared_state["input_text"]  = tokenizer.decode(xb[0].tolist()).replace('\n', ' ')
             shared_state["output_text"] = tokenizer.decode(pred_indices.tolist()).replace('\n', ' ')
+            shared_state["inputs"]      = _normalize(raw_in)
+            shared_state["hidden1"]     = _sample_activations(activations["h1"])
+            shared_state["hidden2"]     = _sample_activations(activations["h2"])
+            shared_state["outputs"]     = list(zip(out_labels, out_probs))
 
             # ── Avaliação e salvamento de checkpoint ──────────────────────────
             if iter > start_iter and iter % Config.EVAL_INTERVAL == 0:
