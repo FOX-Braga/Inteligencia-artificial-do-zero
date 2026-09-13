@@ -1,16 +1,26 @@
 import os
+import hashlib
 import torch
 import threading
+import numpy as np
 from config import Config
-from src.llm.tokenizer import CharTokenizer
+from src.llm.tokenizer import BPETokenizer
 from src.llm.transformer import BigramLanguageModel
+from src.llm.optimizer import AdamW_DML
 from src.visualization.nn_gui import NeuralNetVisualizer
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kw):
+        return x
+
 
 def get_batch(data, block_size, batch_size, device):
     """Gera um pequeno batch de dados para input x e target y"""
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x = torch.stack([data[i:i + block_size] for i in ix])
+    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
     return x.to(device), y.to(device)
 
 @torch.no_grad()
@@ -38,6 +48,8 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
     """Executa o treinamento em uma thread separada."""
     try:
         print(f"Dispositivo de treinamento: {Config.DEVICE}")
+        if str(Config.DEVICE) == 'privateuseone:0':
+            print("GPU detectada via DirectML (AMD/Intel). Aceleração ativa.")
         print(f"Iniciando treinamento a partir do passo {start_iter}...")
 
         for iter in range(start_iter, Config.MAX_ITERS):
@@ -59,7 +71,6 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
                 val_loss = estimate_loss(model, val_data)
                 print(f"Passo {iter}: Loss de Validação {val_loss:.4f}")
 
-                # Salva checkpoint com modelo + otimizador + passo atual
                 torch.save({
                     "model":      model.state_dict(),
                     "optimizer":  optimizer.state_dict(),
@@ -73,7 +84,6 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
             loss.backward()
             optimizer.step()
 
-        # Salvar checkpoint final
         print("Treinamento finalizado. Salvando checkpoint final...")
         torch.save({
             "model":      model.state_dict(),
@@ -90,66 +100,97 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
         shared_state["running"] = False
 
 
-def load_oasst1_text():
+def load_oasst1_text(max_chars=2_000_000):
     """
     Baixa e extrai texto do dataset OpenAssistant/oasst1.
-    Prioriza mensagens em português (pt), depois usa todas as línguas.
+    Prioriza mensagens em português (pt) e limita o volume a `max_chars`
+    (a RX 580 não consegue processar o dataset inteiro em tempo útil).
     """
     from datasets import load_dataset
-    from tqdm import tqdm
 
     print("[DATASET] Baixando OpenAssistant/oasst1 do HuggingFace...")
     print("[DATASET] (Isso pode demorar na primeira vez — será cacheado depois)")
 
     ds = load_dataset("OpenAssistant/oasst1", split="train")
 
-    # Tenta pegar mensagens em português primeiro
     pt_texts = [row["text"] for row in ds if row.get("lang") == "pt" and not row.get("deleted")]
-    
+
     if len(pt_texts) > 200:
         print(f"[DATASET] Usando {len(pt_texts)} mensagens em Português (PT)")
         texts = pt_texts
     else:
-        # Fallback: usa todas as línguas
         texts = [row["text"] for row in tqdm(ds, desc="[DATASET] Extraindo texto") if not row.get("deleted")]
         print(f"[DATASET] Usando {len(texts)} mensagens (todos os idiomas)")
 
-    # Formata como diálogos: "Usuário: ... Assistente: ..."
     full_text = "\n\n".join(texts)
-    print(f"[DATASET] Total de caracteres carregados: {len(full_text):,}")
+    if len(full_text) > max_chars:
+        print(f"[DATASET] Limitando de {len(full_text):,} para {max_chars:,} caracteres "
+              "(limite de hardware / tempo de treino).")
+        full_text = full_text[:max_chars]
+    print(f"[DATASET] Total de caracteres: {len(full_text):,}")
     return full_text
+
+
+DATA_BIN = "data.bin"
+
+
+def prepare_data(text, tokenizer):
+    """
+    Tokeniza o dataset UMA vez e guarda em data.bin (com cache).
+    Nas próximas execuções o arquivo é recarregado instantaneamente.
+    """
+    text_hash = hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+
+    if os.path.exists(DATA_BIN):
+        info = torch.load(DATA_BIN, map_location="cpu", weights_only=False)
+        if info.get("text_hash") == text_hash and info.get("vocab_size") == tokenizer.vocab_size:
+            print(f"[CACHE] Carregando {DATA_BIN} (dataset já tokenizado)…")
+            return info["train"], info["val"]
+
+    print("[BPE] Codificando o dataset inteiro (só na 1ª vez — fica cacheado)…")
+    ids = tuple(tokenizer.encode(text))
+    data = torch.tensor(ids, dtype=torch.long)
+    n = int(0.9 * len(data))
+    train_data, val_data = data[:n], data[n:]
+
+    torch.save({
+        "text_hash": text_hash,
+        "vocab_size": tokenizer.vocab_size,
+        "train": train_data,
+        "val": val_data,
+    }, DATA_BIN)
+    print(f"[CACHE] Dataset salvo em '{DATA_BIN}' para reutilização.")
+    return train_data, val_data
 
 
 def main():
     # 1. Carregar Dataset oasst1
     text = load_oasst1_text()
 
-    # 2. Tokenizar e Salvar Vocab
-    tokenizer = CharTokenizer()
-    tokenizer.train(text)
+    # 2. Treinar Tokenizer BPE e salvar vocab
+    tokenizer = BPETokenizer()
+    tokenizer.train(text, vocab_size=Config.VOCAB_SIZE)
     tokenizer.save("vocab.json")
     Config.VOCAB_SIZE = tokenizer.vocab_size
-    print(f"Tamanho do vocabulário: {Config.VOCAB_SIZE} tokens únicos")
+    print(f"Tamanho do vocabulário: {Config.VOCAB_SIZE} tokens")
 
-    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-    n = int(0.9 * len(data))
-    train_data = data[:n]
-    val_data   = data[n:]
+    # 3. Tokenizar (com cache binário) e dividir em treino/validação
+    train_data, val_data = prepare_data(text, tokenizer)
     print(f"[DATASET] Train: {len(train_data):,} tokens | Val: {len(val_data):,} tokens")
 
-    # 3. Inicializar Modelo e Otimizador
-    model     = BigramLanguageModel(vocab_size=Config.VOCAB_SIZE).to(Config.DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+    # 4. Inicializar Modelo e Otimizador
+    model = BigramLanguageModel(vocab_size=Config.VOCAB_SIZE).to(Config.DEVICE)
+    # AdamW customizado: só operações suportadas pelo DirectML (sem fallback p/ CPU)
+    optimizer = AdamW_DML(model.parameters(), lr=Config.LEARNING_RATE)
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"[MODELO] Parâmetros totais: {total_params:,}")
 
-    # ── RETOMAR DO CHECKPOINT SE EXISTIR ─────────────────────────────────────
+    # ── RETOMAR DO CHECKPOINT SE EXISTIR ────────────────────────────────────
     start_iter = 0
     if os.path.exists(Config.CHECKPOINT_PATH):
         print(f"[CHECKPOINT] Retomando de '{Config.CHECKPOINT_PATH}'...")
         ckpt = torch.load(Config.CHECKPOINT_PATH, map_location=Config.DEVICE, weights_only=False)
-        # Só carrega se o vocab for compatível
         if ckpt.get("vocab_size") == Config.VOCAB_SIZE:
             model.load_state_dict(ckpt["model"])
             optimizer.load_state_dict(ckpt["optimizer"])
@@ -160,7 +201,7 @@ def main():
     else:
         print("[CHECKPOINT] Nenhum checkpoint encontrado — iniciando do zero.")
 
-    # 4. Iniciar treinamento em THREAD SEPARADA
+    # 5. Treinar em THREAD SEPARADA
     train_thread = threading.Thread(
         target=training_loop,
         args=(model, optimizer, train_data, val_data, tokenizer, start_iter),
@@ -168,7 +209,7 @@ def main():
     )
     train_thread.start()
 
-    # 5. GUI roda na THREAD PRINCIPAL (obrigatório no Windows)
+    # 6. GUI roda na THREAD PRINCIPAL (obrigatório no Windows)
     gui = NeuralNetVisualizer()
     gui.run(shared_state)
 

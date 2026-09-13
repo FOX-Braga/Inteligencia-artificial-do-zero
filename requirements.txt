@@ -1,4 +1,6 @@
-torch>=2.0.0
+# PyTorch com backend DirectML (GPU AMD/Intel no Windows).
+# IMPORTANTE: requer Python 3.8-3.12 e instala o PyTorch 2.4.1 automaticamente.
+torch-directml>=0.2.5
 numpy>=1.24.0
 python-dotenv>=1.0.0
 pygame-ce>=2.5.0

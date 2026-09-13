@@ -1,0 +1,23 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Artefatos do treino (pesos, vocabulário, datasets tokenizados)
+*.pth
+vocab.json
+data.bin
+checkpoint.pth
+
+# Cache do Python
+__pycache__/
+*.pyc
+
+# Variáveis de ambiente
+.env
+
+# Histórico de conversas salvo
+history.json
+
+# IDE
+.idea/
+.vscode/
