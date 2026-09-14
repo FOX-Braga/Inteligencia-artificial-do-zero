@@ -1,3 +1,18 @@
 pygame-ce 2.5.8 (SDL 2.32.10, Python 3.12.14)
 [DATASET] Baixando OpenAssistant/oasst1 do HuggingFace...
 [DATASET] (Isso pode demorar na primeira vez — será cacheado depois)
+[DATASET] Usando 82952 mensagens (todos os idiomas)
+[DATASET] Limitando de 41,330,931 para 2,000,000 caracteres (limite de hardware / tempo de treino).
+[DATASET] Total de caracteres: 2,000,000
+[BPE] Treinando 7744 merges em 300,000 bytes...
+  [BPE] merge 1/7744: par (101, 32) (6,810 ocorrências) -> vocab 257
+  [BPE] merge 1000/7744: par (32, 819) (28 ocorrências) -> vocab 1256
+  [BPE] merge 2000/7744: par (1673, 321) (14 ocorrências) -> vocab 2256
+  [BPE] merge 3000/7744: par (319, 313) (9 ocorrências) -> vocab 3256
+  [BPE] merge 4000/7744: par (469, 2686) (6 ocorrências) -> vocab 4256
+  [BPE] merge 5000/7744: par (375, 907) (5 ocorrências) -> vocab 5256
+  [BPE] merge 6000/7744: par (903, 2909) (4 ocorrências) -> vocab 6256
+  [BPE] merge 7000/7744: par (102, 2792) (4 ocorrências) -> vocab 7256
+[BPE] Treino completo. Vocab final: 8000 tokens
+Tamanho do vocabulário: 8000 tokens
+[BPE] Codificando o dataset inteiro (só na 1ª vez — fica cacheado)…

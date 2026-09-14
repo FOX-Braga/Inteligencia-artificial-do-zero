@@ -1,5 +1,6 @@
 import os
 import hashlib
+import time
 import torch
 import threading
 import numpy as np
@@ -51,6 +52,7 @@ shared_state = {
     "hidden2": [],     # ativações reais da 2ª camada oculta amostrada
     "outputs": [],     # lista de (texto_do_token, prob) dos 10 mais prováveis
     "running": True,
+    "status": "Preparando ambiente...",  # mensagem de status p/ a GUI
 }
 
 def _setup_activation_hooks(model):
@@ -83,11 +85,54 @@ def _normalize(vals):
     return [(v - lo) / (hi - lo) for v in vals]
 
 
+def _log_error(context: str):
+    """Grava o traceback completo em error.log para diagnóstico futuro."""
+    import traceback
+    try:
+        with open("error.log", "a", encoding="utf-8") as f:
+            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}\n")
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
+
+
 def _sample_activations(vector, n=14):
     """Amostra n valores uniformemente de um vetor (ex: 384 ativações)."""
     v = vector.float().cpu()
     idx = torch.linspace(0, v.numel() - 1, n).long()
     return _normalize(v[idx].tolist())
+
+
+def _to_cpu(obj):
+    """Move tensores recursivamente para a CPU (torch_directml não serializa
+    tensores DML — torch.save só funciona com tensores em CPU)."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_cpu(v) for v in obj]
+    return obj
+
+
+def _save_checkpoint(model, optimizer, step, verbose=True):
+    """
+    Salva o checkpoint com todos os tensores na CPU. Se o disco estiver
+    cheio, avisa no console e NÃO derruba o treinamento.
+    """
+    try:
+        ckpt = {
+            "model": _to_cpu(model.state_dict()),
+            "optimizer": _to_cpu(optimizer.state_dict()),
+            "step": step,
+            "vocab_size": Config.VOCAB_SIZE,
+        }
+        torch.save(ckpt, Config.CHECKPOINT_PATH)
+        if verbose:
+            print(f"  → Checkpoint salvo em '{Config.CHECKPOINT_PATH}'")
+    except Exception as e:
+        print(f"[AVISO] Não foi possível salvar checkpoint em "
+              f"'{Config.CHECKPOINT_PATH}': {e}")
 
 
 def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=0):
@@ -102,6 +147,8 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
         shared_state["total_steps"] = Config.MAX_ITERS
         activations = _setup_activation_hooks(model)
         n_inputs = min(15, Config.BLOCK_SIZE)
+        acc_steps = max(1, int(getattr(Config, "GRAD_ACCUM_STEPS", 1)))
+        optimizer.zero_grad(set_to_none=True)
 
         for iter in range(start_iter, Config.MAX_ITERS):
             xb, yb = get_batch(train_data, Config.BLOCK_SIZE, Config.BATCH_SIZE, Config.DEVICE)
@@ -131,7 +178,7 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
             shared_state["error_rate"]  = 1.0 - acc
             shared_state["perplexity"]  = ppl
             shared_state["input_text"]  = tokenizer.decode(xb[0].tolist()).replace('\n', ' ')
-            shared_state["output_text"] = tokenizer.decode(pred_indices.tolist()).replace('\n', ' ')
+            shared_state["output_text"] = tokenizer.decode(pred_indices.flatten().tolist()).replace('\n', ' ')
             shared_state["inputs"]      = _normalize(raw_in)
             shared_state["hidden1"]     = _sample_activations(activations["h1"])
             shared_state["hidden2"]     = _sample_activations(activations["h2"])
@@ -142,32 +189,29 @@ def training_loop(model, optimizer, train_data, val_data, tokenizer, start_iter=
                 val_loss = estimate_loss(model, val_data)
                 print(f"Passo {iter}: Loss de Validação {val_loss:.4f}")
 
-                torch.save({
-                    "model":      model.state_dict(),
-                    "optimizer":  optimizer.state_dict(),
-                    "step":       iter,
-                    "vocab_size": Config.VOCAB_SIZE,
-                }, Config.CHECKPOINT_PATH)
-                print(f"  → Checkpoint salvo em '{Config.CHECKPOINT_PATH}'")
+                _save_checkpoint(model, optimizer, iter)
 
-            # Backpropagation
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            # Backpropagation — com gradiente ACUMULADO: só aplica o step a cada
+            # GRAD_ACCUM_STEPS micro-batches (mantém o batch efetivo alto sem
+            # estourar a VRAM da RX 580 no DirectML).
+            (loss / acc_steps).backward()
+            if (iter + 1) % acc_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+        # Aplica o último gradiente acumulado, se sobrou algum
+        if Config.MAX_ITERS % acc_steps != 0:
             optimizer.step()
 
         print("Treinamento finalizado. Salvando checkpoint final...")
-        torch.save({
-            "model":      model.state_dict(),
-            "optimizer":  optimizer.state_dict(),
-            "step":       Config.MAX_ITERS - 1,
-            "vocab_size": Config.VOCAB_SIZE,
-        }, Config.CHECKPOINT_PATH)
-        print(f"Checkpoint salvo em '{Config.CHECKPOINT_PATH}'")
+        _save_checkpoint(model, optimizer, Config.MAX_ITERS - 1)
         shared_state["running"] = False
 
     except Exception as e:
         print(f"\n[ERRO NA THREAD DE TREINAMENTO]: {e}")
         import traceback; traceback.print_exc()
+        _log_error("ERRO NA THREAD DE TREINAMENTO")
+        shared_state["status"] = f"ERRO NO TREINO: {e}"
         shared_state["running"] = False
 
 
@@ -218,7 +262,8 @@ def prepare_data(text, tokenizer):
             print(f"[CACHE] Carregando {DATA_BIN} (dataset já tokenizado)…")
             return info["train"], info["val"]
 
-    print("[BPE] Codificando o dataset inteiro (só na 1ª vez — fica cacheado)…")
+    print("[BPE] Codificando o dataset inteiro (só na 1ª vez — leva ~1h em Python puro). "
+          "Depois fica cacheado em data.bin…")
     ids = tuple(tokenizer.encode(text))
     data = torch.tensor(ids, dtype=torch.long)
     n = int(0.9 * len(data))
@@ -234,22 +279,39 @@ def prepare_data(text, tokenizer):
     return train_data, val_data
 
 
-def main():
-    # 1. Carregar Dataset oasst1
-    text = load_oasst1_text()
+def _try_load_cached():
+    """
+    Se o vocab.json (BPE) e o data.bin (dataset tokenizado) já existirem e
+    forem compatíveis com o VOCAB_SIZE atual, carrega tudo de uma vez — sem
+    baixar dataset, sem treinar BPE, sem codificar nada. Retorna
+    (tokenizer, train_data, val_data) ou None se algum cache estiver inválido.
+    """
+    try:
+        if not os.path.exists("vocab.json") or not os.path.exists(DATA_BIN):
+            return None
+        tokenizer = BPETokenizer()
+        tokenizer.load("vocab.json")
+        if tokenizer.vocab_size != Config.VOCAB_SIZE:
+            return None
+        info = torch.load(DATA_BIN, map_location="cpu", weights_only=False)
+        if not isinstance(info, dict) or info.get("vocab_size") != Config.VOCAB_SIZE:
+            return None
+        if "train" not in info or "val" not in info:
+            return None
+        print("[CACHE] Vocab + dataset já prontos — pulando download/BPE/encode.")
+        return tokenizer, info["train"], info["val"]
+    except Exception as e:
+        print(f"[CACHE] Cache inválido — recriando do zero. ({e})")
+        return None
 
-    # 2. Treinar Tokenizer BPE e salvar vocab
-    tokenizer = BPETokenizer()
-    tokenizer.train(text, vocab_size=Config.VOCAB_SIZE)
-    tokenizer.save("vocab.json")
+
+def _start_training(tokenizer, train_data, val_data):
+    """
+    Cria o modelo de uma vez, retoma do checkpoint se houver e inicia o
+    treinamento em thread separada.
+    """
     Config.VOCAB_SIZE = tokenizer.vocab_size
-    print(f"Tamanho do vocabulário: {Config.VOCAB_SIZE} tokens")
-
-    # 3. Tokenizar (com cache binário) e dividir em treino/validação
-    train_data, val_data = prepare_data(text, tokenizer)
-    print(f"[DATASET] Train: {len(train_data):,} tokens | Val: {len(val_data):,} tokens")
-
-    # 4. Inicializar Modelo e Otimizador
+    shared_state["status"] = "Criando modelo e otimizador..."
     model = BigramLanguageModel(vocab_size=Config.VOCAB_SIZE).to(Config.DEVICE)
     # AdamW customizado: só operações suportadas pelo DirectML (sem fallback p/ CPU)
     optimizer = AdamW_DML(model.parameters(), lr=Config.LEARNING_RATE)
@@ -261,28 +323,112 @@ def main():
     start_iter = 0
     if os.path.exists(Config.CHECKPOINT_PATH):
         print(f"[CHECKPOINT] Retomando de '{Config.CHECKPOINT_PATH}'...")
-        ckpt = torch.load(Config.CHECKPOINT_PATH, map_location=Config.DEVICE, weights_only=False)
-        if ckpt.get("vocab_size") == Config.VOCAB_SIZE:
-            model.load_state_dict(ckpt["model"])
-            optimizer.load_state_dict(ckpt["optimizer"])
-            start_iter = ckpt.get("step", 0) + 1
-            print(f"[CHECKPOINT] Continuando do passo {start_iter} / {Config.MAX_ITERS}")
-        else:
-            print(f"[CHECKPOINT] Vocab mudou ({ckpt.get('vocab_size')} → {Config.VOCAB_SIZE}). Iniciando do zero.")
+        try:
+            # Carrega na CPU e move os estados depois: o map_location="privateuseone:0"
+            # quebra no torch_directml (TypeError no load).
+            ckpt = torch.load(Config.CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+            if ckpt.get("vocab_size") == Config.VOCAB_SIZE:
+                model.load_state_dict(ckpt["model"])
+                optimizer.load_state_dict(ckpt["optimizer"])
+                # Move o estado do otimizador p/ o mesmo device dos parâmetros
+                for p in model.parameters():
+                    st = optimizer.state.get(p)
+                    if st:
+                        for k, v in st.items():
+                            if isinstance(v, torch.Tensor) and v.device != p.device:
+                                st[k] = v.to(p.device)
+                start_iter = ckpt.get("step", 0) + 1
+                print(f"[CHECKPOINT] Continuando do passo {start_iter} / {Config.MAX_ITERS}")
+            else:
+                print(f"[CHECKPOINT] Vocab mudou ({ckpt.get('vocab_size')} → {Config.VOCAB_SIZE}). "
+                      "Iniciando do zero.")
+        except Exception as e:
+            print(f"[CHECKPOINT] Checkpoint incompatível ou corrompido ({e}). "
+                  "Iniciando do zero (o arquivo antigo será ignorado).")
+            os.replace(Config.CHECKPOINT_PATH, Config.CHECKPOINT_PATH + ".incompat")
+            start_iter = 0
     else:
         print("[CHECKPOINT] Nenhum checkpoint encontrado — iniciando do zero.")
 
-    # 5. Treinar em THREAD SEPARADA
+    # Treinar em THREAD SEPARADA
+    shared_state["status"] = "TREINANDO..."
     train_thread = threading.Thread(
         target=training_loop,
         args=(model, optimizer, train_data, val_data, tokenizer, start_iter),
         daemon=True
     )
     train_thread.start()
+    print(f"[DATASET] Train: {len(train_data):,} tokens | Val: {len(val_data):,} tokens")
 
-    # 6. GUI roda na THREAD PRINCIPAL (obrigatório no Windows)
-    gui = NeuralNetVisualizer()
-    gui.run(shared_state)
+
+def prepare_and_train(shared_state):
+    """
+    Roda em thread separada. Se o cache (vocab.json + data.bin) já estiver
+    pronto, NÃO volta do zero: usa o cache e começa a treinar direto. Só
+    baixa o dataset/treina o BPE/codifica na 1ª vez.
+    """
+    try:
+        # Caminho rápido: tudo já está cacheado -> não baixa/treina nada
+        cached = _try_load_cached()
+        if cached is not None:
+            tokenizer, train_data, val_data = cached
+            print(f"[CACHE] Usando {len(train_data):,} tokens de treino "
+                  f"/ {len(val_data):,} de validação já tokenizados.")
+            _start_training(tokenizer, train_data, val_data)
+            return
+
+        # 1ª vez (ou cache apagado): baixa o dataset, treina o BPE e codifica
+        shared_state["status"] = "Baixando dataset OpenAssistant (1a vez demora)..."
+        text = load_oasst1_text(max_chars=2_000_000)
+
+        # 2. Tokenizer BPE: se existir vocab.json compatível, reutiliza.
+        tokenizer = BPETokenizer()
+        if os.path.exists("vocab.json"):
+            tokenizer.load("vocab.json")
+        if tokenizer.vocab_size == Config.VOCAB_SIZE:
+            print(f"[BPE] Reutilizando 'vocab.json' "
+                  f"({tokenizer.vocab_size} tokens) — pulando treino.")
+        else:
+            shared_state["status"] = "Treinando tokenizer BPE (1a vez, demora ~15min)..."
+            tokenizer = BPETokenizer()
+            tokenizer.train(text, vocab_size=Config.VOCAB_SIZE)
+            tokenizer.save("vocab.json")
+        Config.VOCAB_SIZE = tokenizer.vocab_size
+        print(f"Tamanho do vocabulário: {Config.VOCAB_SIZE} tokens")
+
+        # 3. Tokenizar (com cache binário) e dividir em treino/validação
+        shared_state["status"] = "Tokenizando dataset..."
+        train_data, val_data = prepare_data(text, tokenizer)
+        _start_training(tokenizer, train_data, val_data)
+
+    except Exception as e:
+        print(f"\n[ERRO NA PREPARACAO]: {e}")
+        import traceback; traceback.print_exc()
+        _log_error("ERRO NA PREPARACAO")
+        shared_state["status"] = f"ERRO: {e}"
+        shared_state["running"] = False
+
+
+def main():
+    # Preparação + treino em thread separada; GUI abre imediatamente na
+    # thread principal (obrigatório no Windows) e mostra o status em tempo real.
+    prep_thread = threading.Thread(
+        target=prepare_and_train,
+        args=(shared_state,),
+        daemon=True
+    )
+    prep_thread.start()
+
+    try:
+        gui = NeuralNetVisualizer()
+        gui.run(shared_state)
+    except Exception as e:
+        print(f"\n[ERRO NA GUI]: {e}")
+        import traceback; traceback.print_exc()
+        _log_error("ERRO NA GUI")
+        print("O treinamento continuou em segundo plano. O erro completo foi "
+              "salvo em error.log — envie esse arquivo para diagnosticar.")
+        input("Pressione Enter para encerrar...")
 
 
 if __name__ == "__main__":

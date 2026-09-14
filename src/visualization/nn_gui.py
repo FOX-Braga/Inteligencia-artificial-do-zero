@@ -50,6 +50,13 @@ class NeuralNetVisualizer:
         # Histórico do loss (sparkline) — mantido aqui (não cruza threads)
         self.loss_history = deque(maxlen=200)
         self._last_step = -1
+        self._spark = None
+
+        # Caches antigarantia: renderizar fonte é o maior custo da GUI;
+        # guarda as superfícies de texto e as quebras de linha prontas.
+        self._text_cache = {}
+        self._wrap_cache = {}
+        self._MAX_TEXT_CACHE = 4096
 
     # ── Geometria ────────────────────────────────────────────────────────────
     def _calculate_node_positions(self):
@@ -106,28 +113,45 @@ class NeuralNetVisualizer:
 
         self.bg_surface = surf
 
-    # ── Utilidades de texto ──────────────────────────────────────────────────
+    # ── Caches de texto (60 FPS sem re-render de fonte) ──────────────────────
+    def _render_text(self, text, font, color):
+        """Retorna uma superfície de texto cacheada por (fonte, texto, cor)."""
+        key = (id(font), text, color)
+        img = self._text_cache.get(key)
+        if img is None:
+            if len(self._text_cache) >= self._MAX_TEXT_CACHE:
+                self._text_cache.clear()
+            img = font.render(text, True, color)
+            self._text_cache[key] = img
+        return img
+
     def _blit(self, text, x, y, color=WHITE, font=None, aa=True):
         font = font or self.font
-        img = font.render(text, True, color)
+        img = self._render_text(text, font, color)
         self.screen.blit(img, (x, y))
         return img
 
     def _blit_wrap(self, text, x, y, max_w, max_h, color=WHITE, font=None):
         """Desenha texto com quebra de linha, retornando a altura final usada."""
         font = font or self.font
-        words = text.split(" ")
-        lines, line = [], ""
-        for w in words:
-            trial = (line + " " + w).strip()
-            if font.size(trial)[0] <= max_w:
-                line = trial
-            else:
-                if line:
-                    lines.append(line)
-                line = w
-        if line:
-            lines.append(line)
+        key = (id(font), text, max_w)
+        lines = self._wrap_cache.get(key)
+        if lines is None:
+            words = text.split(" ")
+            lines, line = [], ""
+            for w in words:
+                trial = (line + " " + w).strip()
+                if font.size(trial)[0] <= max_w:
+                    line = trial
+                else:
+                    if line:
+                        lines.append(line)
+                    line = w
+            if line:
+                lines.append(line)
+            if len(self._wrap_cache) > 512:
+                self._wrap_cache.clear()
+            self._wrap_cache[key] = lines
         yy = y
         for ln in lines[: max(1, int(max_h / (font.get_height() + 2)))]:
             self._blit(ln, x, yy, color, font)
@@ -149,7 +173,7 @@ class NeuralNetVisualizer:
             if layer_vals:
                 activations.append(layer_vals)
             else:
-                activations.append([0.0] * len(self.layers[len(activations)]))
+                activations.append([0.0] * self.layers[len(activations)])
 
         # Conexões ativas: de cada nó com ativação alta para os nós fortes da
         # próxima camada.
@@ -175,7 +199,7 @@ class NeuralNetVisualizer:
                 pygame.draw.circle(self.screen, color, (x, y), 14, 0)
                 pygame.draw.circle(self.screen, WHITE, (x, y), 14, 1)
                 # Valor numérico dentro/abaixo do nó
-                label = self.small_font.render(f"{act:.1f}", True, (0, 12, 5))
+                label = self._render_text(f"{act:.1f}", self.small_font, (0, 12, 5))
                 self.screen.blit(label, (x - label.get_width() // 2,
                                          y - label.get_height() // 2))
 
@@ -185,7 +209,8 @@ class NeuralNetVisualizer:
             txt = self._clean(tok)
 
             def _ts(s, f=None):
-                return (f or self.small_font).render(s, True, CYAN)
+                f = f or self.small_font
+                return self._render_text(s, f, CYAN)
 
             t_img = _ts(txt)
             p_img = _ts(f"{prob:.2%}", self.small_font)
@@ -207,12 +232,18 @@ class NeuralNetVisualizer:
         step = state.get("step", 0)
         total = state.get("total_steps", 1) or 1
 
-        title = self.big_font.render("IA do Zero - Treinamento", True, GREEN_BRIGHT)
+        title = self._render_text("IA do Zero - Treinamento", self.big_font, GREEN_BRIGHT)
         self.screen.blit(title, (40, 30))
 
-        status = "TREINANDO..." if running else "CONCLUIDO"
-        s_color = GREEN_BRIGHT if running else CYAN
-        self._blit(status, 40, 68, s_color, self.big_font)
+        status = state.get("status") or ("TREINANDO..." if running else "CONCLUIDO")
+        if status.startswith("ERRO"):
+            s_color = RED
+        elif status.startswith(("TREIN", "CONCL")):
+            s_color = GREEN_BRIGHT
+        else:
+            s_color = YELLOW
+        s_font = self.big_font if status.startswith(("TREIN", "CONCL", "ERRO")) else self.small_font
+        self._blit(status, 40, 68, s_color, s_font)
 
         # Cartões de métrica
         cards = [
@@ -228,7 +259,7 @@ class NeuralNetVisualizer:
             pygame.draw.rect(self.screen, (12, 20, 12), (x, 30, card_w, 72))
             pygame.draw.rect(self.screen, BORDER, (x, 30, card_w, 72), 1)
             self._blit(name, x + 10, 36, GREEN_DIM, self.small_font)
-            val = self.font.render(value, True, color)
+            val = self._render_text(value, self.font, color)
             self.screen.blit(val, (x + 10, 58))
             x += card_w + 12
 
@@ -259,25 +290,33 @@ class NeuralNetVisualizer:
         if out_text:
             self._blit_wrap("> " + out_text[:400], 35, y0 + 108, max_w, 50, GREEN_BRIGHT, self.small_font)
 
-        # Sparkline do loss
+        # Sparkline do loss (pré-renderizado; só reconstrói ao mudar o passo)
         gx = self.width - 280
         gy = y0 - 10
         gw = 240
         gh = 60
         pygame.draw.rect(self.screen, (10, 14, 10), (gx, gy, gw, gh))
         pygame.draw.rect(self.screen, BORDER, (gx, gy, gw, gh), 1)
+        if self._spark is not None:
+            self.screen.blit(self._spark, (gx, gy))
         self._blit("LOSS", gx + 6, gy - 2, GREEN_DIM, self.small_font)
-        if len(self.loss_history) > 1:
-            pts = list(self.loss_history)
+
+    def _render_spark(self):
+        """Reconstrói a superfície do sparkline (chamada só quando o loss muda)."""
+        gw, gh = 240, 60
+        surf = pygame.Surface((gw, gh), pygame.SRCALPHA)
+        pts = list(self.loss_history)
+        if len(pts) > 1:
             lo, hi = min(pts), max(pts)
             rng = (hi - lo) or 1.0
             n = len(pts)
             for i in range(1, n):
-                x1 = gx + 6 + (i - 1) * (gw - 12) / (n - 1)
-                y1 = gy + gh - 8 - (pts[i - 1] - lo) / rng * (gh - 18)
-                x2 = gx + 6 + i * (gw - 12) / (n - 1)
-                y2 = gy + gh - 8 - (pts[i] - lo) / rng * (gh - 18)
-                pygame.draw.line(self.screen, GREEN_BRIGHT, (x1, y1), (x2, y2), 2)
+                x1 = 6 + (i - 1) * (gw - 12) / (n - 1)
+                y1 = gh - 8 - (pts[i - 1] - lo) / rng * (gh - 18)
+                x2 = 6 + i * (gw - 12) / (n - 1)
+                y2 = gh - 8 - (pts[i] - lo) / rng * (gh - 18)
+                pygame.draw.line(surf, GREEN_BRIGHT, (x1, y1), (x2, y2), 2)
+        self._spark = surf
 
     # ── Loop principal ───────────────────────────────────────────────────────
     def run(self, shared_state: dict):
@@ -292,6 +331,7 @@ class NeuralNetVisualizer:
             if step != self._last_step:
                 self._last_step = step
                 self.loss_history.append(shared_state.get("loss", 0.0))
+                self._render_spark()
 
             self._last_outputs = shared_state.get("outputs", [])
 
@@ -307,4 +347,4 @@ class NeuralNetVisualizer:
             self._draw_footer(shared_state)
 
             pygame.display.flip()
-            self.clock.tick(30)   # 30 FPS (leve p/ compartilhar GPU com o treino)
+            self.clock.tick(60)   # 60 FPS (texto cacheado mantém o render leve)

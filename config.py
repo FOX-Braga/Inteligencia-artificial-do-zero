@@ -45,15 +45,20 @@ class Config:
 
     # ── Arquitetura do Modelo (GPT-like, ~17M parâmetros) ────────────────────
     VOCAB_SIZE = 8000      # Tokenizer BPE (atualizado dinamicamente no treino)
-    BLOCK_SIZE = 256       # Tamanho máximo do contexto em tokens
+    BLOCK_SIZE = int(os.getenv("BLOCK_SIZE", "128"))   # Contexto max em tokens
+    # 128 em vez de 256: a RX 580 2048SP tem só 4GB de VRAM e 256 estourava a
+    # memória do DirectML (dá OOM / crash no treino). Pode ser ajustado via env.
     N_EMBD = 384           # Dimensão de embedding
     N_HEAD = 8             # Número de cabeças de self-attention (head = 48)
     N_LAYER = 6            # Número de blocos Transformer
     DROPOUT = 0.1
 
     # ── Treinamento ───────────────────────────────────────────────────────────
-    BATCH_SIZE = 32        # Grandes batches diluem o overhead fixo do DirectML
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))      # micro-batch por passo (DML)
+    GRAD_ACCUM_STEPS = int(os.getenv("GRAD_ACCUM_STEPS", "4"))
+    # Gradiente acumulado em BATCH_SIZE*GRAD_ACCUM_STEPS passos = batch efetivo 32.
+    # Batch grande em 1 passo sozinho estourava a VRAM (4GB) e crashava o treino.
     LEARNING_RATE = 3e-4
-    MAX_ITERS = 60000      # Estimado: ~2.5s/passo -> ~40h; use parametros=pare quando quiser
+    MAX_ITERS = int(os.getenv("MAX_ITERS", "60000"))    # ~2.5s/passo; pare quando quiser
     EVAL_INTERVAL = 2000
     CHECKPOINT_PATH = "checkpoint.pth"   # Salva pesos + otimizador
