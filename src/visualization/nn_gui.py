@@ -47,6 +47,13 @@ class NeuralNetVisualizer:
         self._calculate_node_positions()
         self._pre_render_background()
 
+        # Camada da rede renderizada OFFscreen: só é redesenhada quando as
+        # ativações mudam (a cada passo do treino, ~0,8s). Entre passos são
+        # apenas *blits* leves, o que mantém 60 FPS mesmo com a GPU ocupada.
+        self._net_layer = pygame.Surface((self.width, self.height))
+        self._net_layer.blit(self.bg_surface, (0, 0))
+        self._net_sig = None
+
         # Histórico do loss (sparkline) — mantido aqui (não cruza threads)
         self.loss_history = deque(maxlen=200)
         self._last_step = -1
@@ -167,7 +174,10 @@ class NeuralNetVisualizer:
         """
         Pinta os neurônios e conexões de acordo com as ativações reais.
         `values` é uma lista de 4 listas: [inputs, hidden1, hidden2, outputs].
+        Desenha na camada offscreen (`_net_layer`), que o loop só recria quando
+        os valores mudam.
         """
+        target = self._net_layer
         activations = []
         for layer_vals in values:
             if layer_vals:
@@ -189,19 +199,19 @@ class NeuralNetVisualizer:
                     for t in strong_targets:
                         strength = (a_src[s] + a_dst[t]) / 2
                         color = _lerp_color(DIM_GRAY, GREEN_BRIGHT, strength)
-                        pygame.draw.line(self.screen, color, src[s], dst[t], 1)
+                        pygame.draw.line(target, color, src[s], dst[t], 1)
 
         # Nós coloridos (preenchimento proporcional à ativação real)
         for li, layer in enumerate(self.nodes):
             for (x, y), act in zip(layer, activations[li]):
-                pygame.draw.circle(self.screen, BACKGROUND, (x, y), 14)
+                pygame.draw.circle(target, BACKGROUND, (x, y), 14)
                 color = self._node_color(act)
-                pygame.draw.circle(self.screen, color, (x, y), 14, 0)
-                pygame.draw.circle(self.screen, WHITE, (x, y), 14, 1)
+                pygame.draw.circle(target, color, (x, y), 14, 0)
+                pygame.draw.circle(target, WHITE, (x, y), 14, 1)
                 # Valor numérico dentro/abaixo do nó
                 label = self._render_text(f"{act:.1f}", self.small_font, (0, 12, 5))
-                self.screen.blit(label, (x - label.get_width() // 2,
-                                         y - label.get_height() // 2))
+                target.blit(label, (x - label.get_width() // 2,
+                                    y - label.get_height() // 2))
 
         # Rótulos dos tokens na camada de SAÍDA (o que o modelo prevê)
         outputs = self._last_outputs or []
@@ -214,13 +224,25 @@ class NeuralNetVisualizer:
 
             t_img = _ts(txt)
             p_img = _ts(f"{prob:.2%}", self.small_font)
-            self.screen.blit(t_img, (x + 18, y - 11))
-            self.screen.blit(p_img, (x + 18, y + 2))
+            target.blit(t_img, (x + 18, y - 11))
+            target.blit(p_img, (x + 18, y + 2))
 
     def _clean(self, s):
         """Sanitiza um token para exibição."""
         s = s.replace("\n", "\\n").replace(" ", "_")
         return s[:10] if s else "_"
+
+    def _sig(self, state):
+        """Assinatura leve (hash barato) do que a rede exibe num dado momento.
+        Se não mudou entre frames, o desenho da rede é reaproveitado."""
+        def snap(vals, scale=100):
+            return tuple(int(round(v * scale)) for v in vals)
+        activ = (snap(state.get("inputs", [])),
+                 snap(state.get("hidden1", [])),
+                 snap(state.get("hidden2", [])))
+        outputs = tuple((str(tok), int(round(float(prob) * 10000)))
+                        for tok, prob in (self._last_outputs or []))
+        return activ, outputs
 
     # ── Métricas / cabeçalho ─────────────────────────────────────────────────
     def _draw_header(self, state):
@@ -335,14 +357,22 @@ class NeuralNetVisualizer:
 
             self._last_outputs = shared_state.get("outputs", [])
 
+            # Só redesenha a rede quando as ativações/tokens mudam (a cada
+            # passo de treino); nos frames intermediários reusa a camada.
+            sig = self._sig(shared_state)
+            if sig != self._net_sig:
+                self._net_sig = sig
+                self._net_layer.blit(self.bg_surface, (0, 0))
+                self._draw_active_network([
+                    shared_state.get("inputs", []),
+                    shared_state.get("hidden1", []),
+                    shared_state.get("hidden2", []),
+                    [o[1] if isinstance(o, (tuple, list)) else o
+                     for o in self._last_outputs],
+                ])
+
             self.screen.blit(self.bg_surface, (0, 0))
-            self._draw_active_network([
-                shared_state.get("inputs", []),
-                shared_state.get("hidden1", []),
-                shared_state.get("hidden2", []),
-                [o[1] if isinstance(o, (tuple, list)) else o
-                 for o in self._last_outputs],
-            ])
+            self.screen.blit(self._net_layer, (0, 0))
             self._draw_header(shared_state)
             self._draw_footer(shared_state)
 

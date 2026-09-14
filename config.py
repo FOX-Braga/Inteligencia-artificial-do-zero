@@ -16,28 +16,25 @@ def _dml_device():
 def _detect_device():
     """
     Detecta a GPU disponível na máquina, em ordem:
-      1. DirectML (AMD/Intel — qualquer placa DX12 no Windows)
-      2. CUDA (NVIDIA)
-      3. CPU (fallback)
+      1. CPU (padrão — RAM é mais estável que o DirectML na RX 580)
+      2. DirectML (AMD/Intel — opt-in via DEVICE=dml)
+      3. CUDA (NVIDIA — opt-in via DEVICE=cuda)
     """
-    dml = _dml_device()
-    if dml is not None:
-        return dml
-    if torch.cuda.is_available():
-        return "cuda"
     return "cpu"
 
-# Permite forçar o device via variável de ambiente (DEVICE=cpu|cuda|dml)
+# Permite forçar o device via variável de ambiente (DEVICE=cpu|cuda|dml).
+# Padrão: CPU. Para voltar ao DirectML, definir DEVICE=dml no .env.
 _FORCE_DEVICE = os.getenv("DEVICE", "").lower()
 
 def _resolve_device():
-    if _FORCE_DEVICE == "cpu":
-        return "cpu"
-    if _FORCE_DEVICE == "cuda":
-        return "cuda"
     if _FORCE_DEVICE == "dml":
         return _dml_device() or "cpu"
-    return _detect_device()
+    if _FORCE_DEVICE == "cuda":
+        return "cuda"
+    return "cpu"
+
+# CPU: usa todos os núcleos lógicos (Xeon 6C/12T). Ajustável via TORCH_THREADS.
+torch.set_num_threads(int(os.getenv("TORCH_THREADS", os.cpu_count() or 6)))
 
 class Config:
     # Device de execução (auto-detectado, mas pode ser forçado por DEVICE no .env)
@@ -55,20 +52,20 @@ class Config:
     # ── Arquitetura do Modelo (GPT-like, ~17M parâmetros) ────────────────────
     VOCAB_SIZE = 8000      # Tokenizer BPE (atualizado dinamicamente no treino)
     BLOCK_SIZE = int(os.getenv("BLOCK_SIZE", "128"))   # Contexto max em tokens
-    # 128 em vez de 256: a RX 580 2048SP tem só 4GB de VRAM e 256 estourava a
-    # memória do DirectML (dá OOM / crash no treino). Pode ser ajustado via env.
+    # 128 (e não 256): a RX 580 2048SP tem só 4GB de VRAM e 256 estourava no
+    # DirectML. Em CPU/RAM (padrão atual) também é um bom tamanho de contexto.
     N_EMBD = 384           # Dimensão de embedding
     N_HEAD = 8             # Número de cabeças de self-attention (head = 48)
     N_LAYER = 6            # Número de blocos Transformer
     DROPOUT = 0.1
 
     # ── Treinamento ───────────────────────────────────────────────────────────
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))      # micro-batch por passo (DML)
-    GRAD_ACCUM_STEPS = int(os.getenv("GRAD_ACCUM_STEPS", "4"))
-    # Gradiente acumulado em BATCH_SIZE*GRAD_ACCUM_STEPS passos = batch efetivo 32.
-    # Batch grande em 1 passo sozinho estourava a VRAM (4GB) e crashava o treino.
+    # Em CPU/RAM (padrão) dá para usar micro-batch maior que na VRAM da RX 580.
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))     # micro-batch por passo
+    GRAD_ACCUM_STEPS = int(os.getenv("GRAD_ACCUM_STEPS", "2"))
+    # Batch efetivo = BATCH_SIZE * GRAD_ACCUM_STEPS = 32 (mesmo de antes).
     LEARNING_RATE = 3e-4
-    MAX_ITERS = int(os.getenv("MAX_ITERS", "60000"))    # ~2.5s/passo; pare quando quiser
+    MAX_ITERS = int(os.getenv("MAX_ITERS", "60000"))    # pare quando quiser
     EVAL_INTERVAL = 2000
     CHECKPOINT_PATH = os.getenv("CHECKPOINT_PATH",
                                 os.path.join(LLM_DIR, "checkpoint.pth"))   # Salva pesos + otimizador
