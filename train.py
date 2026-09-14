@@ -89,7 +89,7 @@ def _log_error(context: str):
     """Grava o traceback completo em error.log para diagnóstico futuro."""
     import traceback
     try:
-        with open("error.log", "a", encoding="utf-8") as f:
+        with open(Config.ERROR_LOG, "a", encoding="utf-8") as f:
             f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}\n")
             traceback.print_exc(file=f)
     except Exception:
@@ -246,7 +246,7 @@ def load_oasst1_text(max_chars=2_000_000):
     return full_text
 
 
-DATA_BIN = "data.bin"
+DATA_BIN = Config.DATA_BIN_PATH
 
 
 def prepare_data(text, tokenizer):
@@ -287,10 +287,10 @@ def _try_load_cached():
     (tokenizer, train_data, val_data) ou None se algum cache estiver inválido.
     """
     try:
-        if not os.path.exists("vocab.json") or not os.path.exists(DATA_BIN):
+        if not os.path.exists(Config.VOCAB_PATH) or not os.path.exists(DATA_BIN):
             return None
         tokenizer = BPETokenizer()
-        tokenizer.load("vocab.json")
+        tokenizer.load(Config.VOCAB_PATH)
         if tokenizer.vocab_size != Config.VOCAB_SIZE:
             return None
         info = torch.load(DATA_BIN, map_location="cpu", weights_only=False)
@@ -383,16 +383,16 @@ def prepare_and_train(shared_state):
 
         # 2. Tokenizer BPE: se existir vocab.json compatível, reutiliza.
         tokenizer = BPETokenizer()
-        if os.path.exists("vocab.json"):
-            tokenizer.load("vocab.json")
+        if os.path.exists(Config.VOCAB_PATH):
+            tokenizer.load(Config.VOCAB_PATH)
         if tokenizer.vocab_size == Config.VOCAB_SIZE:
-            print(f"[BPE] Reutilizando 'vocab.json' "
+            print(f"[BPE] Reutilizando '{Config.VOCAB_PATH}' "
                   f"({tokenizer.vocab_size} tokens) — pulando treino.")
         else:
             shared_state["status"] = "Treinando tokenizer BPE (1a vez, demora ~15min)..."
             tokenizer = BPETokenizer()
             tokenizer.train(text, vocab_size=Config.VOCAB_SIZE)
-            tokenizer.save("vocab.json")
+            tokenizer.save(Config.VOCAB_PATH)
         Config.VOCAB_SIZE = tokenizer.vocab_size
         print(f"Tamanho do vocabulário: {Config.VOCAB_SIZE} tokens")
 

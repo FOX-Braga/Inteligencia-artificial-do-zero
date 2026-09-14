@@ -6,9 +6,11 @@ import os
 
 
 class LocalGenerator:
-    def __init__(self, model_path: str = "model_weights.pth", vocab_path: str = "vocab.json"):
+    def __init__(self, model_path: str = None, vocab_path: str = None):
         self.device = Config.DEVICE
         self.tokenizer = BPETokenizer()
+        model_path = model_path or Config.MODEL_PATH
+        vocab_path = vocab_path or Config.VOCAB_PATH
         self.tokenizer.load(vocab_path)
 
         # Garantir que o config usa o tamanho real do vocabulário carregado
