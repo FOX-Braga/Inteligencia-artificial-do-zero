@@ -2,13 +2,14 @@ from src.llm.generator import LocalGenerator
 from src.agent.core import LocalAgent
 from src.tools.calculator import CalculatorTool
 from src.tools.search import SearchTool
+from config import Config
 
 def main():
     print("Inicializando o Agente de IA (Modelo Local criado do Zero)...")
     
     # 1. Inicializar o gerador (carrega os pesos e o vocabulário localmente)
     # Se o modelo não foi treinado, ele vai gerar um aviso e usar pesos aleatórios
-    generator = LocalGenerator(model_path="model_weights.pth", vocab_path="vocab.json")
+    generator = LocalGenerator(model_path=Config.MODEL_PATH, vocab_path=Config.VOCAB_PATH)
         
     # 2. Inicializar Tools (As ferramentas estão aqui, mas nosso modelo pequeno
     # recém-criado precisaria de muito fine-tuning pra aprender a usá-las)
